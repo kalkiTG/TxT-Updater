@@ -1,0 +1,12 @@
+# Session files
+*.session
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# System
+.DS_Store
