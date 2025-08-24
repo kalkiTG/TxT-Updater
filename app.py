@@ -1,137 +1,135 @@
 import os
 import asyncio
-import logging
-import threading
+from telethon import TelegramClient, events, Button
+from datetime import datetime
+import pytz
 from flask import Flask
 from dotenv import load_dotenv
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pathlib import Path
 
-# Load .env
 load_dotenv()
+
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 LOG_CHANNEL = int(os.getenv("LOG_CHANNEL"))
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+client = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# Create folders for uploads
-os.makedirs("downloads", exist_ok=True)
-
-# Initialize Flask app for Render
+# Flask app for Render keep-alive
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is running fine! ✅"
+    return "Bot is running successfully!"
 
-# Initialize Telegram bot
-bot = Client("link_cleaner_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Globals for file handling
+user_sessions = {}
 
-# Session dictionary to manage user state
-sessions = {}
+# Get IST Time
+def get_ist_time():
+    ist = pytz.timezone('Asia/Kolkata')
+    return datetime.now(ist).strftime("%d-%m-%Y %I:%M:%S %p")
 
-# Start command
-@bot.on_message(filters.command("start"))
-async def start_cmd(client, message):
-    sessions[message.from_user.id] = {}
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📂 Upload Old File", callback_data="upload_old")],
-        [InlineKeyboardButton("📂 Upload New File", callback_data="upload_new")],
-        [InlineKeyboardButton("✅ Convert", callback_data="convert")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
-    ])
-    await message.reply_text(
-        f"👋 Hello {message.from_user.first_name}!\n\n"
-        "**Welcome to Link Cleaner Bot**\n"
-        "Upload two files:\n"
-        "- Old links file\n"
-        "- New links file\n\n"
-        "Then click Convert.\n\n"
-        "ᴍᴀʀꜱʜᴍᴀʟʟᴏᴡ×͜×",
-        reply_markup=keyboard
+# Start Command
+@client.on(events.NewMessage(pattern="/start"))
+async def start(event):
+    await event.respond(
+        f"👋 Hello {event.sender.first_name}!\n\n"
+        "Upload your **Old File** first.\n\n"
+        f"Made with ❤️ by ᴍᴀʀꜱʜᴍᴀʟʟᴏᴡ×͜×",
+        buttons=[
+            [Button.text("❌ Cancel", resize=True)]
+        ]
     )
+    user_sessions[event.sender_id] = {"status": "waiting_old"}
 
-# Callback handler
-@bot.on_callback_query()
-async def button_handler(client, query):
-    user_id = query.from_user.id
-    if query.data == "upload_old":
-        await query.message.reply_text("Please send me the **old file**.")
-        sessions[user_id]["awaiting"] = "old"
-    elif query.data == "upload_new":
-        await query.message.reply_text("Please send me the **new file**.")
-        sessions[user_id]["awaiting"] = "new"
-    elif query.data == "convert":
-        await convert_files(query.message, user_id)
-    elif query.data == "cancel":
-        sessions[user_id] = {}
-        await query.message.reply_text("✅ Process canceled. Start again with /start.")
+# Cancel Command
+@client.on(events.NewMessage(pattern="/cancel"))
+async def cancel(event):
+    user_sessions.pop(event.sender_id, None)
+    await event.respond("✅ Process cancelled. Start again with /start.\n\nᴍᴀʀꜱʜᴍᴀʟʟᴏᴡ×͜×")
 
-# File upload
-@bot.on_message(filters.document)
-async def handle_files(client, message):
-    user_id = message.from_user.id
-    if user_id not in sessions or "awaiting" not in sessions[user_id]:
-        await message.reply_text("Please use /start and select what file to upload.")
+# File Upload Handler
+@client.on(events.NewMessage(func=lambda e: e.file))
+async def handle_file(event):
+    user_id = event.sender_id
+    if user_id not in user_sessions:
+        await event.respond("Please start with /start first.")
         return
 
-    file_type = sessions[user_id]["awaiting"]
-    file_path = f"downloads/{user_id}_{file_type}.txt"
-    await message.download(file_path)
-    sessions[user_id][file_type] = file_path
-    sessions[user_id].pop("awaiting", None)
-    await message.reply_text(f"✅ {file_type.capitalize()} file saved!")
+    status = user_sessions[user_id].get("status")
 
-# Conversion logic
-async def convert_files(message, user_id):
-    session = sessions.get(user_id, {})
-    old_file = session.get("old")
-    new_file = session.get("new")
+    if status == "waiting_old":
+        old_file_path = f"old_{user_id}.txt"
+        await event.download_media(file=old_file_path)
+        user_sessions[user_id]["old_file"] = old_file_path
+        user_sessions[user_id]["status"] = "waiting_new"
+        await event.respond("✅ Old file received. Now upload **New File**.")
+    elif status == "waiting_new":
+        new_file_path = f"new_{user_id}.txt"
+        await event.download_media(file=new_file_path)
+        user_sessions[user_id]["new_file"] = new_file_path
+        await process_files(event, user_id)
 
-    if not old_file or not new_file:
-        await message.reply_text("❌ Both files are required. Upload them first.")
-        return
+async def process_files(event, user_id):
+    session = user_sessions[user_id]
+    old_file = session["old_file"]
+    new_file = session["new_file"]
 
-    # Read files
+    # Read old links
     with open(old_file, 'r', encoding='utf-8') as f:
         old_links = set(line.strip() for line in f if line.strip())
+
+    # Read new links
     with open(new_file, 'r', encoding='utf-8') as f:
         new_links = [line.strip() for line in f if line.strip()]
 
-    # Filter
+    # Filter new links
     updated_links = [link for link in new_links if link not in old_links]
-    updated_file = new_file.replace(".txt", "_updated.txt")
+
+    # Save updated file
+    updated_file = f"{os.path.splitext(new_file)[0]}_updated.txt"
     with open(updated_file, 'w', encoding='utf-8') as f:
         f.write("\n".join(updated_links))
 
-    # Stylish caption
+    total_old = len(old_links)
+    total_new = len(new_links)
+    total_updated = len(updated_links)
+
     caption = (
-        f"✨ **Link Cleaning Complete** ✨\n\n"
-        f"👤 **User:** {message.from_user.first_name} (@{message.from_user.username})\n"
-        f"🆔 **User ID:** `{user_id}`\n\n"
-        f"📜 Old File: `{len(old_links)}` links\n"
-        f"📜 New File: `{len(new_links)}` links\n"
-        f"✅ Updated File: `{len(updated_links)}` links\n\n"
-        f"ᴍᴀʀꜱʜᴍᴀʟʟᴏᴡ×͜×"
+        f"✨ **Links Updated Successfully** ✨\n\n"
+        f"🧾 **Old File Links**: `{total_old}`\n"
+        f"🆕 **New File Links**: `{total_new}`\n"
+        f"✅ **Remaining Links**: `{total_updated}`\n\n"
+        f"🕒 **Time (IST)**: {get_ist_time()}\n\n"
+        f"Made with ❤️ by ᴍᴀʀꜱʜᴍᴀʟʟᴏᴡ×͜×"
     )
 
-    # Send files back to user
-    await message.reply_document(updated_file, caption=caption)
+    await event.respond(file=updated_file, message=caption)
 
-    # Log channel
-    await bot.send_message(LOG_CHANNEL, f"🔔 New Conversion by **{message.from_user.first_name}** (@{message.from_user.username})")
-    await bot.send_document(LOG_CHANNEL, old_file, caption="📂 Old File")
-    await bot.send_document(LOG_CHANNEL, new_file, caption="📂 New File")
-    await bot.send_document(LOG_CHANNEL, updated_file, caption="📂 Updated File")
+    # Send logs to channel
+    sender = await event.get_sender()
+    log_text = (
+        f"📢 **Process Completed**\n\n"
+        f"👤 User: {sender.first_name} (@{sender.username})\n"
+        f"🆔 User ID: `{sender.id}`\n\n"
+        f"🧾 Old Links: {total_old}\n"
+        f"🆕 New Links: {total_new}\n"
+        f"✅ Updated: {total_updated}\n"
+        f"🕒 Time: {get_ist_time()}\n"
+    )
+    await client.send_message(LOG_CHANNEL, log_text, file=[old_file, new_file, updated_file])
 
-# Run Flask + Bot together
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # Cleanup session
+    user_sessions.pop(user_id, None)
+
+# Run both Flask and Bot
+async def main():
+    await client.start()
+    print("Bot is running...")
+    await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask).start()
-    bot.run()
+    import threading
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))).start()
+    asyncio.run(main())
