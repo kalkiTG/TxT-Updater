@@ -1,202 +1,137 @@
 import os
-from flask import Flask
-from telethon import TelegramClient, events, Button
-from dotenv import load_dotenv
 import asyncio
-from datetime import datetime
+import logging
+import threading
+from flask import Flask
+from dotenv import load_dotenv
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pathlib import Path
 
-# Load environment variables
+# Load .env
 load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 LOG_CHANNEL = int(os.getenv("LOG_CHANNEL"))
 
-# Flask app for keep-alive
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
+# Create folders for uploads
+os.makedirs("downloads", exist_ok=True)
+
+# Initialize Flask app for Render
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is running!"
+    return "Bot is running fine! ✅"
 
-# Telegram Bot
-bot = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+# Initialize Telegram bot
+bot = Client("link_cleaner_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Memory for storing user files and state
-user_files = {}
-updated_files = {}
+# Session dictionary to manage user state
+sessions = {}
 
-# Function to show main menu
-async def show_main_menu(event):
-    buttons = [
-        [Button.text("📂 Upload Old File", resize=True), Button.text("📂 Upload New File", resize=True)],
-        [Button.text("✅ Convert", resize=True)]
-    ]
-    await event.respond(
-        "<b>👋 Welcome to the Link Cleaner Bot!</b>\n\n"
-        "✅ Upload your <b>Old File</b> and <b>New File</b>, then click <b>Convert</b>.\n\n"
-        "<i>This bot removes duplicate links from the new file based on the old file.</i>",
-        buttons=buttons,
-        parse_mode='html'
+# Start command
+@bot.on_message(filters.command("start"))
+async def start_cmd(client, message):
+    sessions[message.from_user.id] = {}
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📂 Upload Old File", callback_data="upload_old")],
+        [InlineKeyboardButton("📂 Upload New File", callback_data="upload_new")],
+        [InlineKeyboardButton("✅ Convert", callback_data="convert")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+    ])
+    await message.reply_text(
+        f"👋 Hello {message.from_user.first_name}!\n\n"
+        "**Welcome to Link Cleaner Bot**\n"
+        "Upload two files:\n"
+        "- Old links file\n"
+        "- New links file\n\n"
+        "Then click Convert.\n\n"
+        "ᴍᴀʀꜱʜᴍᴀʟʟᴏᴡ×͜×",
+        reply_markup=keyboard
     )
 
-# Start Command
-@bot.on(events.NewMessage(pattern='/start'))
-async def start_handler(event):
-    user_files[event.chat_id] = {'old': None, 'new': None}
-    await show_main_menu(event)
+# Callback handler
+@bot.on_callback_query()
+async def button_handler(client, query):
+    user_id = query.from_user.id
+    if query.data == "upload_old":
+        await query.message.reply_text("Please send me the **old file**.")
+        sessions[user_id]["awaiting"] = "old"
+    elif query.data == "upload_new":
+        await query.message.reply_text("Please send me the **new file**.")
+        sessions[user_id]["awaiting"] = "new"
+    elif query.data == "convert":
+        await convert_files(query.message, user_id)
+    elif query.data == "cancel":
+        sessions[user_id] = {}
+        await query.message.reply_text("✅ Process canceled. Start again with /start.")
 
-# Cancel Command
-@bot.on(events.NewMessage(pattern='/cancel'))
-async def cancel_handler(event):
-    chat_id = event.chat_id
-    if chat_id in user_files:
-        user_files[chat_id] = {'old': None, 'new': None}
-    await event.respond("<b>❌ Process canceled! Start fresh by uploading files again.</b>", parse_mode='html')
-    await show_main_menu(event)
-
-# File Upload Handler
-@bot.on(events.NewMessage)
-async def file_handler(event):
-    if event.file and event.file.name.endswith('.txt'):
-        chat_id = event.chat_id
-        if chat_id not in user_files:
-            user_files[chat_id] = {'old': None, 'new': None}
-
-        # Determine file type
-        if user_files[chat_id]['old'] is None:
-            file_type = 'old'
-        elif user_files[chat_id]['new'] is None:
-            file_type = 'new'
-        else:
-            await event.respond("<b>You already uploaded both files!</b>\nUse /cancel to start over.", parse_mode='html')
-            return
-
-        if not os.path.exists('downloads'):
-            os.makedirs('downloads')
-
-        file_path = f"downloads/{file_type}_{event.file.name}"
-        await event.download_media(file_path)
-        user_files[chat_id][file_type] = file_path
-
-        await event.respond(f"<b>✅ {file_type.capitalize()} file uploaded successfully!</b>", parse_mode='html')
-
-# Convert Button Handler
-@bot.on(events.NewMessage(pattern='✅ Convert'))
-async def convert_handler(event):
-    chat_id = event.chat_id
-    if chat_id not in user_files or not user_files[chat_id]['old'] or not user_files[chat_id]['new']:
-        await event.respond("<b>Please upload both Old and New files first!</b>", parse_mode='html')
+# File upload
+@bot.on_message(filters.document)
+async def handle_files(client, message):
+    user_id = message.from_user.id
+    if user_id not in sessions or "awaiting" not in sessions[user_id]:
+        await message.reply_text("Please use /start and select what file to upload.")
         return
 
-    old_file_path = user_files[chat_id]['old']
-    new_file_path = user_files[chat_id]['new']
+    file_type = sessions[user_id]["awaiting"]
+    file_path = f"downloads/{user_id}_{file_type}.txt"
+    await message.download(file_path)
+    sessions[user_id][file_type] = file_path
+    sessions[user_id].pop("awaiting", None)
+    await message.reply_text(f"✅ {file_type.capitalize()} file saved!")
 
-    # Process files
-    with open(old_file_path, 'r', encoding='utf-8') as f:
+# Conversion logic
+async def convert_files(message, user_id):
+    session = sessions.get(user_id, {})
+    old_file = session.get("old")
+    new_file = session.get("new")
+
+    if not old_file or not new_file:
+        await message.reply_text("❌ Both files are required. Upload them first.")
+        return
+
+    # Read files
+    with open(old_file, 'r', encoding='utf-8') as f:
         old_links = set(line.strip() for line in f if line.strip())
-    with open(new_file_path, 'r', encoding='utf-8') as f:
+    with open(new_file, 'r', encoding='utf-8') as f:
         new_links = [line.strip() for line in f if line.strip()]
 
+    # Filter
     updated_links = [link for link in new_links if link not in old_links]
-    removed_count = len(new_links) - len(updated_links)
+    updated_file = new_file.replace(".txt", "_updated.txt")
+    with open(updated_file, 'w', encoding='utf-8') as f:
+        f.write("\n".join(updated_links))
 
-    base, ext = os.path.splitext(new_file_path)
-    updated_file_path = f"{base}_updated{ext}"
-    with open(updated_file_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(updated_links))
+    # Stylish caption
+    caption = (
+        f"✨ **Link Cleaning Complete** ✨\n\n"
+        f"👤 **User:** {message.from_user.first_name} (@{message.from_user.username})\n"
+        f"🆔 **User ID:** `{user_id}`\n\n"
+        f"📜 Old File: `{len(old_links)}` links\n"
+        f"📜 New File: `{len(new_links)}` links\n"
+        f"✅ Updated File: `{len(updated_links)}` links\n\n"
+        f"ᴍᴀʀꜱʜᴍᴀʟʟᴏᴡ×͜×"
+    )
 
-    updated_files[chat_id] = updated_file_path
+    # Send files back to user
+    await message.reply_document(updated_file, caption=caption)
 
-    # Count media
-    video_count = sum(1 for link in updated_links if link.lower().endswith(('.mp4', '.mkv')))
-    pdf_count = sum(1 for link in updated_links if link.lower().endswith('.pdf'))
+    # Log channel
+    await bot.send_message(LOG_CHANNEL, f"🔔 New Conversion by **{message.from_user.first_name}** (@{message.from_user.username})")
+    await bot.send_document(LOG_CHANNEL, old_file, caption="📂 Old File")
+    await bot.send_document(LOG_CHANNEL, new_file, caption="📂 New File")
+    await bot.send_document(LOG_CHANNEL, updated_file, caption="📂 Updated File")
 
-    # Stylish caption for user
-    caption = f"""
-<b>✅ Update Completed!</b>
-
-<b>📂 Old Links:</b> {len(old_links)}
-<b>🆕 New Links:</b> {len(new_links)}
-<b>🔍 Updated Links:</b> {len(updated_links)}
-<b>❌ Removed:</b> {removed_count}
-
-<b>🎬 Videos:</b> {video_count}
-<b>📄 PDFs:</b> {pdf_count}
-
-<i>✨ Powered by Stylish Bot ✨</i>
-"""
-
-    # Log caption with user info
-    user = await bot.get_entity(chat_id)
-    username = f"@{user.username}" if user.username else "N/A"
-    log_caption = f"""
-<b>📢 New Conversion Completed</b>
-
-<b>👤 User:</b> {username}
-<b>🆔 User ID:</b> {chat_id}
-<b>⏰ Time:</b> {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
-
-<b>📂 Old Links:</b> {len(old_links)}
-<b>🆕 New Links:</b> {len(new_links)}
-<b>✅ Updated Links:</b> {len(updated_links)}
-<b>❌ Removed:</b> {removed_count}
-
-<b>🎬 Videos:</b> {video_count}
-<b>📄 PDFs:</b> {pdf_count}
-"""
-
-    # Send files to log channel
-    await bot.send_file(LOG_CHANNEL, old_file_path, caption="<b>📂 Old File</b>", parse_mode='html')
-    await bot.send_file(LOG_CHANNEL, new_file_path, caption="<b>🆕 New File</b>", parse_mode='html')
-    await bot.send_file(LOG_CHANNEL, updated_file_path, caption=log_caption, parse_mode='html')
-
-    # Send updated file to user with extra buttons
-    buttons = [
-        [Button.text("🔄 Start Over", resize=True), Button.text("📥 Download Updated Again", resize=True)],
-        [Button.text("❓ Help", resize=True)]
-    ]
-    await event.respond(file=updated_file_path, caption="<b>✅ Here is your updated file!</b>", buttons=buttons, parse_mode='html')
-
-    # Clear uploaded old/new for fresh start (keep updated path for re-download)
-    user_files[chat_id] = {'old': None, 'new': None}
-
-# Handle post-conversion buttons
-@bot.on(events.NewMessage(pattern='🔄 Start Over'))
-async def start_over(event):
-    chat_id = event.chat_id
-    user_files[chat_id] = {'old': None, 'new': None}
-    await show_main_menu(event)
-
-@bot.on(events.NewMessage(pattern='📥 Download Updated Again'))
-async def download_again(event):
-    chat_id = event.chat_id
-    if chat_id in updated_files and os.path.exists(updated_files[chat_id]):
-        await event.respond(file=updated_files[chat_id], caption="<b>📥 Your updated file again!</b>", parse_mode='html')
-    else:
-        await event.respond("<b>No updated file found! Please upload files and convert first.</b>", parse_mode='html')
-
-@bot.on(events.NewMessage(pattern='❓ Help'))
-async def help_handler(event):
-    help_text = """
-<b>📘 Help Menu</b>
-
-1️⃣ /start → Start the bot  
-2️⃣ /cancel → Cancel current process  
-3️⃣ Upload Old File and New File  
-4️⃣ Tap ✅ Convert to clean links  
-5️⃣ Download your updated file  
-"""
-    await event.respond(help_text, parse_mode='html')
-
-# Flask + Bot
+# Run Flask + Bot together
 def run_flask():
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
-
-loop = asyncio.get_event_loop()
-loop.create_task(bot.run_until_disconnected())
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
 if __name__ == "__main__":
-    from threading import Thread
-    Thread(target=run_flask).start()
-    loop.run_forever()
+    threading.Thread(target=run_flask).start()
+    bot.run()
