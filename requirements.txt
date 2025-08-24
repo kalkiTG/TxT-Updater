@@ -1,8 +1,4 @@
-# Core dependencies
-Telethon==1.28.5
-Werkzeug==2.1.2  # Pinned to avoid conflicts
-pyrogram==2.0.106
-tgcrypto
-Flask==2.3.2
-python-dotenv==1.0.0
-gunicorn==21.2.0
+telethon==1.36.0
+flask==3.0.3
+pytz==2024.1
+python-dotenv==1.0.1
