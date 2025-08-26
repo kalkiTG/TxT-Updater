@@ -1,122 +1,199 @@
 import os
-import time
+import re
+import asyncio
 import logging
-from telethon import TelegramClient, events, Button
 from datetime import datetime
-from pytz import timezone
+from threading import Thread
+from pathlib import Path
+from urllib.parse import urlparse, parse_qsl, urlencode, unquote
+
+from dotenv import load_dotenv
 from flask import Flask
-import threading
+from telethon import TelegramClient, events, Button
+import pytz
 
-# =====================
-# CONFIG
-# =====================
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-LOG_CHANNEL = int(os.getenv("LOG_CHANNEL"))
-BRAND = "🔗 Link Updater Bot"
-PORT = int(os.getenv("PORT", 8080))  # For Render health check
-SESSIONS = {}
+# ============== ENV SETUP ==============
+load_dotenv()
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+LOG_CHANNEL = int(os.getenv("LOG_CHANNEL", "0"))
+PORT = int(os.getenv("PORT", "10000"))  # For Render
 
-# =====================
-# LOGGER
-# =====================
+assert API_ID and API_HASH and BOT_TOKEN and LOG_CHANNEL, "Please set API_ID, API_HASH, BOT_TOKEN, LOG_CHANNEL env vars."
+
+# ============== LOGGING ==============
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger("txt-updater")
 
-# =====================
-# BOT CLIENT
-# =====================
-bot = TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+# ============== CONSTANTS ==============
+BRAND = "ᴍᴀʀꜱʜᴍᴀʟʟᴏᴡ×͜×"
+DATA_DIR = Path("downloads")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# =====================
-# FLASK HEALTH SERVER
-# =====================
-app = Flask(__name__)
+# ============== HELPERS ==============
+def ist_now_str() -> str:
+    """Return current time in Indian Standard Time."""
+    ist = pytz.timezone("Asia/Kolkata")
+    return datetime.now(ist).strftime("%d-%m-%Y %I:%M:%S %p")
 
-@app.route("/")
-def home():
-    return "Bot is running fine!", 200
+def stylish_user(u):
+    uname = f"@{u.username}" if getattr(u, "username", None) else "N/A"
+    return f"{u.first_name or 'User'} ({uname})"
 
-# Run Flask in background
-threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT)).start()
+def normalize_link(url: str) -> str:
+    """
+    Normalize URLs for comparison:
+    - decode %xx
+    - drop scheme, lowercase host, strip leading 'www.'
+    - remove trailing slash on path
+    - remove tracking query params (utm_*, fbclid, gclid, gclsrc, ref, ref_src, mc_cid, mc_eid, igshid, spm)
+    - keep other query params (sorted)
+    - drop fragments
+    Returns a canonical string like: example.com/path?key=value
+    """
+    if not url:
+        return ""
+    url = unquote(url.strip())
+    p = urlparse(url)
 
-# =====================
-# UTILITIES
-# =====================
-def ist_now_str():
-    return datetime.now(timezone("Asia/Kolkata")).strftime("%d-%m-%Y %I:%M %p")
+    # If somehow scheme absent but looks like a URL, keep as-is best we can
+    netloc = p.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
 
-def stylish_user(user):
-    name = user.first_name or "User"
-    if user.last_name:
-        name += f" {user.last_name}"
-    return f"{name}"
+    path = unquote(p.path or "")
+    if path.endswith("/") and path != "/":
+        path = path[:-1]
 
-def extract_link(line: str) -> str:
-    """Extract link from 'title : link' or plain link format"""
+    # filter tracking params
+    tracking_keys = {"fbclid", "gclid", "gclsrc", "ref", "ref_src", "mc_cid", "mc_eid", "igshid", "spm"}
+    params = []
+    for k, v in parse_qsl(p.query or "", keep_blank_values=True):
+        lk = k.lower()
+        if lk.startswith("utm_") or lk in tracking_keys:
+            continue
+        params.append((k, v))
+    params.sort()
+    query = urlencode(params, doseq=True)
+
+    norm = f"{netloc}{path}"
+    if query:
+        norm += f"?{query}"
+    return norm
+
+def extract_link_from_line(line: str) -> str:
+    """
+    Extract the URL from a 'Title: link' line.
+    Prefer an explicit http(s)://... in the line (anywhere).
+    Fallback: take substring after the last ':' or last whitespace.
+    """
+    if not line:
+        return ""
+    m = re.search(r'(https?://\S+)', line)
+    if m:
+        return normalize_link(m.group(1))
+    # Fallbacks if URL not matched explicitly
     if ":" in line:
-        return line.split(":", 1)[-1].strip().lower()
+        return normalize_link(line.rsplit(":", 1)[-1].strip())
     parts = line.split()
-    return parts[-1].lower() if parts else ""
+    return normalize_link(parts[-1] if parts else "")
 
-# =====================
-# START COMMAND
-# =====================
-@bot.on(events.NewMessage(pattern="/start"))
-async def start(event):
-    await event.respond(
-        "👋 Welcome!\n\nUpload your **OLD file** first, then your **NEW file**.\n\n"
-        "I will create an updated file with only new links that are not in the old file.",
-        buttons=[
-            [Button.text("📂 Upload OLD File")],
-            [Button.text("📂 Upload NEW File")],
-            [Button.text("ℹ Help")]
+# ============== SESSIONS ==============
+SESSIONS = {}  # { chat_id: {"awaiting": "old"/"new"/None, "old": path, "new": path, "updated": path} }
+
+# ============== TELEGRAM BOT ==============
+client = None
+
+def register_handlers(c: TelegramClient):
+    # /start
+    @c.on(events.NewMessage(pattern=r'^/start$'))
+    async def start_handler(event):
+        chat_id = event.chat_id
+        SESSIONS[chat_id] = {"awaiting": None, "old": None, "new": None, "updated": None}
+
+        buttons = [
+            [Button.inline("📂 Upload Old File", data=b"upload_old")],
+            [Button.inline("📂 Upload New File", data=b"upload_new")],
+            [Button.inline("✅ Convert", data=b"convert")],
+            [Button.inline("❌ Cancel", data=b"cancel")]
         ]
-    )
+        await event.respond(
+            f"👋 Hello {event.sender.first_name}!\n\n"
+            "<b>Welcome to the Link Cleaner Bot</b>\n"
+            "• Each line should be: <b>Title: link</b>\n"
+            "• Send two .txt files:\n"
+            "   1) <b>Old file</b>\n"
+            "   2) <b>New file</b>\n"
+            "• Tap <b>Convert</b> → removes lines from NEW if their link exists in OLD.\n\n"
+            f"🕒 <b>Time (IST)</b>: {ist_now_str()}\n"
+            f"— {BRAND}",
+            buttons=buttons, parse_mode="html"
+        )
 
-# =====================
-# HELP COMMAND
-# =====================
-@bot.on(events.NewMessage(pattern="/help"))
-async def help_cmd(event):
-    await event.respond(
-        "ℹ **How to use this bot:**\n\n"
-        "1️⃣ Send OLD file (.txt)\n"
-        "2️⃣ Send NEW file (.txt)\n"
-        "✅ Bot will give you an updated file with only unique new lines.\n\n"
-        f"{BRAND}",
-        parse_mode="md"
-    )
+    # /cancel
+    @c.on(events.NewMessage(pattern=r'^/cancel$'))
+    async def cancel_handler(event):
+        chat_id = event.chat_id
+        SESSIONS[chat_id] = {"awaiting": None, "old": None, "new": None, "updated": None}
+        await event.respond(f"✅ Process cancelled. You can start again with /start.\n— {BRAND}")
 
-# =====================
-# FILE HANDLER
-# =====================
-@bot.on(events.NewMessage(func=lambda e: e.file and e.file.name.endswith(".txt")))
-async def handle_file(event):
-    chat_id = event.chat_id
-    sess = SESSIONS.get(chat_id, {})
-    file_name = event.file.name
+    # Inline buttons
+    @c.on(events.CallbackQuery)
+    async def callbacks(event):
+        chat_id = event.chat_id
+        data = (event.data or b"").decode("utf-8", errors="ignore")
 
-    # Download file
-    file_path = await event.download_media()
-    logger.info(f"Received file {file_name} from {chat_id}")
+        if chat_id not in SESSIONS:
+            SESSIONS[chat_id] = {"awaiting": None, "old": None, "new": None, "updated": None}
 
-    if not sess.get("old"):
-        sess["old"] = file_path
-        await event.reply("✅ Old file saved.\n\nNow send the **NEW file**.")
-    elif not sess.get("new"):
-        sess["new"] = file_path
-        await event.reply("✅ New file saved.\n\nProcessing your files...")
-        await convert_now(bot, chat_id)
-    else:
-        await event.reply("❌ You already uploaded both files.\nUse /start to reset.")
+        if data == "upload_old":
+            SESSIONS[chat_id]["awaiting"] = "old"
+            await event.answer("Send the OLD .txt file now.", alert=True)
+            await event.respond("📥 Please send the <b>OLD</b> .txt file.", parse_mode="html")
 
-    SESSIONS[chat_id] = sess
+        elif data == "upload_new":
+            SESSIONS[chat_id]["awaiting"] = "new"
+            await event.answer("Send the NEW .txt file now.", alert=True)
+            await event.respond("📥 Please send the <b>NEW</b> .txt file.", parse_mode="html")
 
-# =====================
-# MAIN CONVERSION LOGIC
-# =====================
+        elif data == "cancel":
+            SESSIONS[chat_id] = {"awaiting": None, "old": None, "new": None, "updated": None}
+            await event.answer("Process cancelled.", alert=True)
+            await event.respond(f"✅ Cancelled. Use /start to begin again.\n— {BRAND}")
+
+        elif data == "convert":
+            await event.answer("Processing…", alert=False)
+            await convert_now(c, chat_id)
+
+    # File receiver (.txt)
+    @c.on(events.NewMessage(func=lambda e: bool(e.file)))
+    async def file_handler(event):
+        chat_id = event.chat_id
+        sess = SESSIONS.setdefault(chat_id, {"awaiting": None, "old": None, "new": None, "updated": None})
+
+        if not event.file or not (event.file.name or "").lower().endswith(".txt"):
+            await event.respond("❌ Please send a .txt file.")
+            return
+
+        if sess.get("awaiting") not in ("old", "new"):
+            await event.respond("ℹ️ Choose what to upload first: use /start and the buttons.")
+            return
+
+        which = sess["awaiting"]
+        safe_name = (event.file.name or f"{which}.txt").replace("/", "_").replace("\\", "_")
+        # Avoid overwriting when both files share same filename:
+        path = DATA_DIR / (f"{which}_{safe_name}")  # no user id in filename
+        await event.download_media(file=str(path))
+        sess[which] = str(path)
+        sess["awaiting"] = None
+
+        await event.respond(
+            f"✅ <b>{which.capitalize()} file</b> saved.\nNow tap <b>Convert</b> when both files are uploaded.",
+            parse_mode="html"
+        )
+
+# ============== CONVERSION ==============
 async def convert_now(c: TelegramClient, chat_id: int):
     sess = SESSIONS.get(chat_id) or {}
     old_file = sess.get("old")
@@ -126,91 +203,146 @@ async def convert_now(c: TelegramClient, chat_id: int):
         await c.send_message(chat_id, "❌ Please upload both OLD and NEW .txt files first.")
         return
 
-    # Read old links
+    # Build set of normalized links from OLD file
     old_links = set()
     with open(old_file, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            if line.strip():
-                old_links.add(extract_link(line))
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            norm = extract_link_from_line(line)
+            if norm:
+                old_links.add(norm)
 
-    updated_lines = []
+    # Process NEW file: keep only lines whose (normalized) link not in old_links; de-dupe within new
+    kept_lines = []
     seen_links = set()
+    kept_videos = 0
+    kept_pdfs = 0
     total_new_lines = 0
-    video_count = 0
-    pdf_count = 0
 
-    # Process new file lines
     with open(new_file, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
+        for raw in f:
+            line = raw.strip()
             if not line:
                 continue
             total_new_lines += 1
-            link = extract_link(line)
-            if link not in old_links and link not in seen_links:
-                updated_lines.append(line)
-                seen_links.add(link)
-                if link.endswith((".mp4", ".mkv", ".mov", ".avi")):
-                    video_count += 1
-                if link.endswith(".pdf"):
-                    pdf_count += 1
+            # Extract + normalize link
+            m = re.search(r'(https?://\S+)', line)
+            link_for_count = m.group(1).lower() if m else ""
+            norm = extract_link_from_line(line)
+            if not norm:
+                # If a line has no detectable URL, keep it (optional: you can choose to drop)
+                kept_lines.append(line)
+                continue
+            if norm in old_links or norm in seen_links:
+                continue  # remove this line
+            kept_lines.append(line)
+            seen_links.add(norm)
+            # Counts by extension
+            if link_for_count.endswith((".mp4", ".mkv", ".mov", ".avi")):
+                kept_videos += 1
+            if link_for_count.endswith(".pdf"):
+                kept_pdfs += 1
 
-    # If no new links
-    if len(updated_lines) == 0:
-        await c.send_message(chat_id, "✅ No new links found! Everything is already up to date.")
-        await c.send_message(LOG_CHANNEL, f"ℹ User {chat_id} uploaded files but no new links were found.")
-        sess.clear()
-        return
+    kept_count = len(kept_lines)
+    removed = max(0, total_new_lines - kept_count)
 
-    # Save updated file
-    updated_file = os.path.splitext(new_file)[0] + "_updated.txt"
+    # Compose final file content (keep lines + summary footer)
+    final_lines = list(kept_lines) + [
+        "",
+        f"# Total Updated Lines: {kept_count}",
+        f"# Videos: {kept_videos}",
+        f"# PDFs: {kept_pdfs}",
+    ]
+
+    # Save updated file alongside NEW (same base + _updated.txt; no user id)
+    base = os.path.splitext(new_file)[0]
+    updated_file = f"{base}_updated.txt"
     with open(updated_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(updated_lines))
+        f.write("\n".join(final_lines))
 
-    removed = total_new_lines - len(updated_lines)
-
-    # Caption for user
+    # Build captions
     user = await c.get_entity(chat_id)
     fancy_user = stylish_user(user)
-    caption_user = (
-        f"✅ <b>Update Complete</b>\n\n"
+    user_caption = (
+        "✨ <b>Link Cleaning Complete</b> ✨\n\n"
         f"👤 <b>User</b>: {fancy_user}\n"
         f"🆔 <b>User ID</b>: <code>{chat_id}</code>\n"
         f"🕒 <b>Time (IST)</b>: {ist_now_str()}\n\n"
-        f"📂 Old Links: <code>{len(old_links)}</code>\n"
-        f"📂 New Lines: <code>{total_new_lines}</code>\n"
-        f"✅ Added: <code>{len(updated_lines)}</code>\n"
-        f"❌ Ignored: <code>{removed}</code>\n"
-        f"🎬 Videos: <code>{video_count}</code> • 📄 PDFs: <code>{pdf_count}</code>\n"
+        f"📂 <b>Old Links</b>: <code>{len(old_links)}</code>\n"
+        f"🆕 <b>New Lines</b>: <code>{total_new_lines}</code>\n"
+        f"✅ <b>Updated Lines</b>: <code>{kept_count}</code>\n"
+        f"❌ <b>Removed</b>: <code>{removed}</code>\n"
+        f"🎬 <b>Videos</b>: <code>{kept_videos}</code> • 📄 <b>PDFs</b>: <code>{kept_pdfs}</code>\n\n"
         f"— {BRAND}"
     )
 
-    # Send updated file to user with buttons
     buttons = [
-        [Button.text("🔄 Start Over"), Button.text("📥 Download Again")],
-        [Button.text("❌ Cancel")]
+        [Button.text("🔄 Start Over", resize=True), Button.text("📥 Download Updated Again", resize=True)],
+        [Button.text("❌ Cancel", resize=True)]
     ]
-    await c.send_file(chat_id, updated_file, caption=caption_user, parse_mode="html", buttons=buttons)
+    await c.send_file(chat_id, updated_file, caption=user_caption, parse_mode="html", buttons=buttons)
 
-    # Send logs
-    caption_log = (
-        f"📢 <b>Conversion Done</b>\n"
-        f"👤 User: {fancy_user}\n"
-        f"🆔 ID: <code>{chat_id}</code>\n"
-        f"⏰ Time: {ist_now_str()}\n"
-        f"Old: {len(old_links)} | New: {total_new_lines} | Added: {len(updated_lines)}\n"
-        f"Videos: {video_count} | PDFs: {pdf_count}"
-    )
-    await c.send_message(LOG_CHANNEL, caption_log, parse_mode="html")
-    await c.send_file(LOG_CHANNEL, old_file, caption="📂 Old File")
-    await c.send_file(LOG_CHANNEL, new_file, caption="📂 New File")
-    await c.send_file(LOG_CHANNEL, updated_file, caption="📂 Updated File")
+    # Log channel (updated file only to reduce noise)
+    await c.send_file(LOG_CHANNEL, updated_file, caption=f"✅ Cleaned File by {fancy_user}", parse_mode="html")
 
-    # Reset session
-    sess.clear()
+    # Update session
+    sess["updated"] = updated_file
+    sess["old"] = None
+    sess["new"] = None
 
-# =====================
-# RUN BOT
-# =====================
-print("✅ Bot is running...")
-bot.run_until_disconnected()
+# ============== EXTRA BUTTONS ==============
+def register_text_buttons(c: TelegramClient):
+    @c.on(events.NewMessage(pattern=r'^🔄 Start Over$'))
+    async def start_over(event):
+        chat_id = event.chat_id
+        SESSIONS[chat_id] = {"awaiting": None, "old": None, "new": None, "updated": None}
+        await c.send_message(chat_id, "🔄 Fresh start! Use /start to upload files again.\n— " + BRAND)
+
+    @c.on(events.NewMessage(pattern=r'^📥 Download Updated Again$'))
+    async def download_again(event):
+        chat_id = event.chat_id
+        sess = SESSIONS.get(chat_id) or {}
+        upd = sess.get("updated")
+        if upd and os.path.exists(upd):
+            await c.send_file(chat_id, upd, caption="📥 Your updated file again!\n— " + BRAND)
+        else:
+            await c.send_message(chat_id, "⚠️ No updated file found. Please /start and process again.\n— " + BRAND)
+
+    @c.on(events.NewMessage(pattern=r'^❌ Cancel$'))
+    async def cancel_btn(event):
+        chat_id = event.chat_id
+        SESSIONS[chat_id] = {"awaiting": None, "old": None, "new": None, "updated": None}
+        await c.send_message(chat_id, "✅ Cancelled. Use /start to begin again.\n— " + BRAND)
+
+# ============== START BOT THREAD ==============
+def start_bot():
+    global client
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    client = TelegramClient("bot", API_ID, API_HASH, loop=loop)
+    register_handlers(client)
+    register_text_buttons(client)
+
+    async def runner():
+        await client.start(bot_token=BOT_TOKEN)
+        log.info("Telethon bot started.")
+        await client.run_until_disconnected()
+
+    try:
+        loop.run_until_complete(runner())
+    finally:
+        loop.close()
+
+# ============== FLASK (Render health) ==============
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
+def index():
+    return f"TxT-Updater is alive. Time (IST): {ist_now_str()} — {BRAND}"
+
+# ============== ENTRYPOINT ==============
+if __name__ == "__main__":
+    Thread(target=start_bot, daemon=True).start()
+    flask_app.run(host="0.0.0.0", port=PORT)
