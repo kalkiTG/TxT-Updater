@@ -5,6 +5,7 @@ from telethon import TelegramClient, events, Button
 from datetime import datetime
 from pytz import timezone
 from flask import Flask
+import threading
 
 # =====================
 # CONFIG
@@ -38,7 +39,6 @@ def home():
     return "Bot is running fine!", 200
 
 # Run Flask in background
-import threading
 threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT)).start()
 
 # =====================
@@ -53,8 +53,12 @@ def stylish_user(user):
         name += f" {user.last_name}"
     return f"{name}"
 
-def normalize_link(link: str) -> str:
-    return link.strip().lower()
+def extract_link(line: str) -> str:
+    """Extract link from 'title : link' or plain link format"""
+    if ":" in line:
+        return line.split(":", 1)[-1].strip().lower()
+    parts = line.split()
+    return parts[-1].lower() if parts else ""
 
 # =====================
 # START COMMAND
@@ -65,7 +69,9 @@ async def start(event):
         "👋 Welcome!\n\nUpload your **OLD file** first, then your **NEW file**.\n\n"
         "I will create an updated file with only new links that are not in the old file.",
         buttons=[
-            [Button.text("❓ Help", resize=True)]
+            [Button.text("📂 Upload OLD File")],
+            [Button.text("📂 Upload NEW File")],
+            [Button.text("ℹ Help")]
         ]
     )
 
@@ -120,15 +126,7 @@ async def convert_now(c: TelegramClient, chat_id: int):
         await c.send_message(chat_id, "❌ Please upload both OLD and NEW .txt files first.")
         return
 
-    def extract_link(line: str) -> str:
-        if ":" in line:
-            link = line.split(":", 1)[-1].strip()
-        else:
-            parts = line.split()
-            link = parts[-1] if parts else ""
-        return normalize_link(link)
-
-    # Read and deduplicate old links
+    # Read old links
     old_links = set()
     with open(old_file, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -137,7 +135,7 @@ async def convert_now(c: TelegramClient, chat_id: int):
 
     updated_lines = []
     seen_links = set()
-    total_links = 0
+    total_new_lines = 0
     video_count = 0
     pdf_count = 0
 
@@ -147,77 +145,69 @@ async def convert_now(c: TelegramClient, chat_id: int):
             line = line.strip()
             if not line:
                 continue
-            total_links += 1
+            total_new_lines += 1
             link = extract_link(line)
             if link not in old_links and link not in seen_links:
                 updated_lines.append(line)
                 seen_links.add(link)
-                if link.lower().endswith((".mp4", ".mkv", ".mov", ".avi")):
+                if link.endswith((".mp4", ".mkv", ".mov", ".avi")):
                     video_count += 1
-                if link.lower().endswith(".pdf"):
+                if link.endswith(".pdf"):
                     pdf_count += 1
 
-    # If no new links found
+    # If no new links
     if len(updated_lines) == 0:
         await c.send_message(chat_id, "✅ No new links found! Everything is already up to date.")
         await c.send_message(LOG_CHANNEL, f"ℹ User {chat_id} uploaded files but no new links were found.")
-        # Reset session
-        sess["old"] = None
-        sess["new"] = None
+        sess.clear()
         return
 
-    # Save updated file (same name with _updated suffix)
-    base = os.path.splitext(new_file)[0]
-    updated_file = f"{base}_updated.txt"
+    # Save updated file
+    updated_file = os.path.splitext(new_file)[0] + "_updated.txt"
     with open(updated_file, "w", encoding="utf-8") as f:
         f.write("\n".join(updated_lines))
 
-    removed = total_links - len(updated_lines)
+    removed = total_new_lines - len(updated_lines)
 
     # Caption for user
     user = await c.get_entity(chat_id)
     fancy_user = stylish_user(user)
     caption_user = (
-        f"✅ <b>Conversion Complete</b>\n\n"
+        f"✅ <b>Update Complete</b>\n\n"
         f"👤 <b>User</b>: {fancy_user}\n"
         f"🆔 <b>User ID</b>: <code>{chat_id}</code>\n"
         f"🕒 <b>Time (IST)</b>: {ist_now_str()}\n\n"
         f"📂 Old Links: <code>{len(old_links)}</code>\n"
-        f"📂 New Lines: <code>{total_links}</code>\n"
-        f"✅ Updated Lines: <code>{len(updated_lines)}</code>\n"
-        f"❌ Removed: <code>{removed}</code>\n"
+        f"📂 New Lines: <code>{total_new_lines}</code>\n"
+        f"✅ Added: <code>{len(updated_lines)}</code>\n"
+        f"❌ Ignored: <code>{removed}</code>\n"
         f"🎬 Videos: <code>{video_count}</code> • 📄 PDFs: <code>{pdf_count}</code>\n"
         f"— {BRAND}"
     )
 
-    # Send updated file to user
+    # Send updated file to user with buttons
     buttons = [
-        [Button.text("🔄 Start Over", resize=True)],
-        [Button.text("📥 Download Updated Again", resize=True)],
-        [Button.text("❌ Cancel", resize=True)]
+        [Button.text("🔄 Start Over"), Button.text("📥 Download Again")],
+        [Button.text("❌ Cancel")]
     ]
     await c.send_file(chat_id, updated_file, caption=caption_user, parse_mode="html", buttons=buttons)
 
-    # Caption for log channel
+    # Send logs
     caption_log = (
-        f"📢 <b>New Conversion</b>\n"
+        f"📢 <b>Conversion Done</b>\n"
         f"👤 User: {fancy_user}\n"
         f"🆔 ID: <code>{chat_id}</code>\n"
         f"⏰ Time: {ist_now_str()}\n"
-        f"Old: {len(old_links)} • New: {total_links} • Updated: {len(updated_lines)}\n"
+        f"Old: {len(old_links)} | New: {total_new_lines} | Added: {len(updated_lines)}\n"
         f"Videos: {video_count} | PDFs: {pdf_count}"
     )
-
-    # Send all files to log channel
     await c.send_message(LOG_CHANNEL, caption_log, parse_mode="html")
-    await c.send_file(LOG_CHANNEL, old_file, caption="📂 Old File", parse_mode="html")
-    await c.send_file(LOG_CHANNEL, new_file, caption="📂 New File", parse_mode="html")
-    await c.send_file(LOG_CHANNEL, updated_file, caption="📂 Updated File", parse_mode="html")
+    await c.send_file(LOG_CHANNEL, old_file, caption="📂 Old File")
+    await c.send_file(LOG_CHANNEL, new_file, caption="📂 New File")
+    await c.send_file(LOG_CHANNEL, updated_file, caption="📂 Updated File")
 
     # Reset session
-    sess["updated"] = updated_file
-    sess["old"] = None
-    sess["new"] = None
+    sess.clear()
 
 # =====================
 # RUN BOT
