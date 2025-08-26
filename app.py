@@ -31,6 +31,18 @@ BRAND = "ᴍᴀʀꜱʜᴍᴀʟʟᴏᴡ×͜×"
 DATA_DIR = Path("downloads")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# Video domain patterns
+VIDEO_DOMAINS = [
+    'youtube.com', 'youtu.be', 'vimeo.com', 'dailymotion.com', 
+    'twitch.tv', 'facebook.com', 'instagram.com', 'tiktok.com',
+    'netflix.com', 'hulu.com', 'disneyplus.com', 'primevideo.com',
+    'vimeo.com', 'dailymotion.com', 'metacafe.com', 'veoh.com',
+    'rutube.ru', 'ok.ru', 'bitchute.com', 'odysee.com'
+]
+
+# Video file extensions
+VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.mov', '.avi', '.wmv', '.flv', '.webm', '.m4v', '.mpeg', '.mpg', '.3gp']
+
 # ============== HELPERS ==============
 def ist_now_str() -> str:
     """Return current time in Indian Standard Time."""
@@ -112,6 +124,30 @@ def extract_link_from_line(line: str) -> str:
         return normalize_link(line.rsplit(":", 1)[-1].strip())
     parts = line.split()
     return normalize_link(parts[-1] if parts else "")
+
+def is_video_link(url: str) -> bool:
+    """Check if a URL points to a video (either video domain or video file extension)"""
+    if not url:
+        return False
+    
+    # Check for video file extensions
+    if any(url.endswith(ext) for ext in VIDEO_EXTENSIONS):
+        return True
+    
+    # Check for video domains
+    parsed = urlparse(url if '://' in url else 'http://' + url)
+    domain = parsed.netloc.lower()
+    
+    # Remove www. prefix if present
+    if domain.startswith('www.'):
+        domain = domain[4:]
+        
+    # Check if domain matches any known video domains
+    for video_domain in VIDEO_DOMAINS:
+        if domain == video_domain or domain.endswith('.' + video_domain):
+            return True
+            
+    return False
 
 # ============== SESSIONS ==============
 SESSIONS = {}  # { chat_id: {"awaiting": "old"/"new"/None, "old": path, "new": path, "updated": path} }
@@ -224,6 +260,7 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
     # Build set of normalized links from OLD file
     old_links = set()
     old_lines_count = 0
+    old_videos = 0
     with open(old_file, "r", encoding="utf-8", errors="ignore") as f:
         for raw in f:
             line = raw.strip()
@@ -233,6 +270,8 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
             norm = extract_link_from_line(line)
             if norm:
                 old_links.add(norm)
+                if is_video_link(norm):
+                    old_videos += 1
 
     # Process NEW file: keep only lines whose (normalized) link not in old_links; de-dupe within new
     kept_lines = []
@@ -240,6 +279,7 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
     kept_videos = 0
     kept_pdfs = 0
     total_new_lines = 0
+    new_videos = 0
 
     with open(new_file, "r", encoding="utf-8", errors="ignore") as f:
         for raw in f:
@@ -249,6 +289,11 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
             total_new_lines += 1
             # Extract + normalize link
             norm = extract_link_from_line(line)
+            
+            # Count videos in new file
+            if norm and is_video_link(norm):
+                new_videos += 1
+                
             if not norm:
                 # If a line has no detectable URL, keep it
                 kept_lines.append(line)
@@ -257,8 +302,8 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
                 continue  # remove this line
             kept_lines.append(line)
             seen_links.add(norm)
-            # Counts by extension
-            if any(ext in norm for ext in [".mp4", ".mkv", ".mov", ".avi", ".webm"]):
+            # Counts by type
+            if is_video_link(norm):
                 kept_videos += 1
             if ".pdf" in norm:
                 kept_pdfs += 1
@@ -266,6 +311,11 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
     kept_count = len(kept_lines)
     removed = max(0, total_new_lines - kept_count)
 
+    # Get original new file name for the updated file
+    original_new_name = os.path.basename(new_file).replace(f"{chat_id}_new_", "")
+    updated_file_name = f"{os.path.splitext(original_new_name)[0]}×͜×.txt"
+    updated_file_path = DATA_DIR / updated_file_name
+    
     # Compose final file content (keep lines + summary footer)
     final_lines = list(kept_lines) + [
         "",
@@ -275,15 +325,15 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
         f"# Removed Duplicates: {removed}",
     ]
 
-    # Save updated file alongside NEW (same base + _updated.txt)
-    base = os.path.splitext(new_file)[0]
-    updated_file = f"{base}_updated.txt"
-    with open(updated_file, "w", encoding="utf-8") as f:
+    # Save updated file
+    with open(updated_file_path, "w", encoding="utf-8") as f:
         f.write("\n".join(final_lines))
 
     # Build captions
     user = await c.get_entity(chat_id)
     fancy_user = stylish_user(user)
+    
+    # User caption
     user_caption = (
         "✨ <b>Link Cleaning Complete</b> ✨\n\n"
         f"👤 <b>User</b>: {fancy_user}\n"
@@ -291,19 +341,29 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
         f"🕒 <b>Time (IST)</b>: {ist_now_str()}\n\n"
         f"📂 <b>Old File Lines</b>: <code>{old_lines_count}</code>\n"
         f"📂 <b>Old Unique Links</b>: <code>{len(old_links)}</code>\n"
+        f"📂 <b>Old Videos</b>: <code>{old_videos}</code>\n"
         f"🆕 <b>New Lines</b>: <code>{total_new_lines}</code>\n"
+        f"🆕 <b>New Videos</b>: <code>{new_videos}</code>\n"
         f"✅ <b>Updated Lines</b>: <code>{kept_count}</code>\n"
+        f"✅ <b>Updated Videos</b>: <code>{kept_videos}</code>\n"
         f"❌ <b>Removed</b>: <code>{removed}</code>\n"
         f"🎬 <b>Videos</b>: <code>{kept_videos}</code> • 📄 <b>PDFs</b>: <code>{kept_pdfs}</code>\n\n"
         f"— {BRAND}"
     )
 
+    # Log caption
     log_caption = (
-        f"✅ Cleaned File by {fancy_user}\n"
-        f"User ID: {chat_id}\n"
-        f"Time (IST): {ist_now_str()}\n"
-        f"Old Lines: {old_lines_count} | Old Links: {len(old_links)}\n"
-        f"New Lines: {total_new_lines} | Updated: {kept_count} | Removed: {removed}"
+        f"📁 <b>Files Processed</b>\n\n"
+        f"👤 <b>User</b>: {fancy_user}\n"
+        f"🆔 <b>User ID</b>: <code>{chat_id}</code>\n"
+        f"🕒 <b>Time (IST)</b>: {ist_now_str()}\n\n"
+        f"📂 <b>Old File</b>: <code>{os.path.basename(old_file)}</code>\n"
+        f"   └ <b>Lines</b>: {old_lines_count} | <b>Links</b>: {len(old_links)} | <b>Videos</b>: {old_videos}\n\n"
+        f"📂 <b>New File</b>: <code>{os.path.basename(new_file)}</code>\n"
+        f"   └ <b>Lines</b>: {total_new_lines} | <b>Videos</b>: {new_videos}\n\n"
+        f"📂 <b>Updated File</b>: <code>{updated_file_name}</code>\n"
+        f"   └ <b>Lines</b>: {kept_count} | <b>Videos</b>: {kept_videos} | <b>PDFs</b>: {kept_pdfs} | <b>Removed</b>: {removed}\n\n"
+        f"— {BRAND}"
     )
 
     buttons = [
@@ -312,17 +372,40 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
     ]
     
     # Send to user
-    await c.send_file(chat_id, updated_file, caption=user_caption, parse_mode="html", buttons=buttons)
+    await c.send_file(chat_id, updated_file_path, caption=user_caption, parse_mode="html", buttons=buttons)
     
-    # Send to log channel
+    # Send all files to log channel
     try:
-        await c.send_file(LOG_CHANNEL, updated_file, caption=log_caption, parse_mode="html")
-        log.info(f"Sent file to log channel {LOG_CHANNEL}")
+        # Send old file
+        await c.send_file(
+            LOG_CHANNEL, 
+            old_file, 
+            caption=f"📁 <b>Old File</b>\n👤 {fancy_user}\n🆔 {chat_id}\n🕒 {ist_now_str()}\n— {BRAND}", 
+            parse_mode="html"
+        )
+        
+        # Send new file
+        await c.send_file(
+            LOG_CHANNEL, 
+            new_file, 
+            caption=f"📁 <b>New File</b>\n👤 {fancy_user}\n🆔 {chat_id}\n🕒 {ist_now_str()}\n— {BRAND}", 
+            parse_mode="html"
+        )
+        
+        # Send updated file with detailed caption
+        await c.send_file(
+            LOG_CHANNEL, 
+            updated_file_path, 
+            caption=log_caption, 
+            parse_mode="html"
+        )
+        
+        log.info(f"Sent all files to log channel {LOG_CHANNEL}")
     except Exception as e:
-        log.error(f"Failed to send file to log channel: {e}")
+        log.error(f"Failed to send files to log channel: {e}")
 
     # Update session
-    sess["updated"] = updated_file
+    sess["updated"] = str(updated_file_path)
     sess["old"] = None
     sess["new"] = None
 
