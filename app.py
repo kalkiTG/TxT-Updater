@@ -6,6 +6,7 @@ from datetime import datetime
 from threading import Thread
 from pathlib import Path
 from urllib.parse import urlparse, parse_qsl, urlencode, unquote
+from typing import Set, List, Tuple, Dict
 
 from dotenv import load_dotenv
 from flask import Flask
@@ -31,17 +32,26 @@ BRAND = "ᴍᴀʀꜱʜᴍᴀʟʟᴏᴡ×͜×"
 DATA_DIR = Path("downloads")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Video domain patterns
+# Video domain patterns - expanded list
 VIDEO_DOMAINS = [
     'youtube.com', 'youtu.be', 'vimeo.com', 'dailymotion.com', 
     'twitch.tv', 'facebook.com', 'instagram.com', 'tiktok.com',
     'netflix.com', 'hulu.com', 'disneyplus.com', 'primevideo.com',
     'vimeo.com', 'dailymotion.com', 'metacafe.com', 'veoh.com',
-    'rutube.ru', 'ok.ru', 'bitchute.com', 'odysee.com'
+    'rutube.ru', 'ok.ru', 'bitchute.com', 'odysee.com', 'v.redd.it',
+    'streamable.com', 'gfycat.com', 'redgifs.com', 'imgur.com',
+    'flickr.com', 'vid.me', '9gag.com', 'funnyordie.com',
+    'clippituser.tv', 'coub.com', 'giphy.com', 'mediaset.it',
+    'raiplay.it', 'la7.it', 'nowtv.it', 'disney+.com',
+    'cloudfront.net', 'brightcove.com', 'brightcove.net'
 ]
 
 # Video file extensions
-VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.mov', '.avi', '.wmv', '.flv', '.webm', '.m4v', '.mpeg', '.mpg', '.3gp']
+VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.mov', '.avi', '.wmv', '.flv', '.webm', '.m4v', '.mpeg', '.mpg', '.3gp', '.m2ts', '.ts', '.mts', '.m3u8']
+
+# PDF file extensions and patterns
+PDF_EXTENSIONS = ['.pdf']
+PDF_DOMAINS = ['crwilladmin.com']
 
 # ============== HELPERS ==============
 def ist_now_str() -> str:
@@ -130,12 +140,15 @@ def is_video_link(url: str) -> bool:
     if not url:
         return False
     
-    # Check for video file extensions
-    if any(url.endswith(ext) for ext in VIDEO_EXTENSIONS):
+    # Check for video file extensions in the path
+    parsed = urlparse(url if '://' in url else 'http://' + url)
+    path = parsed.path.lower()
+    
+    # Check if path ends with video extensions
+    if any(path.endswith(ext) for ext in VIDEO_EXTENSIONS):
         return True
     
     # Check for video domains
-    parsed = urlparse(url if '://' in url else 'http://' + url)
     domain = parsed.netloc.lower()
     
     # Remove www. prefix if present
@@ -145,6 +158,33 @@ def is_video_link(url: str) -> bool:
     # Check if domain matches any known video domains
     for video_domain in VIDEO_DOMAINS:
         if domain == video_domain or domain.endswith('.' + video_domain):
+            return True
+            
+    return False
+
+def is_pdf_link(url: str) -> bool:
+    """Check if a URL points to a PDF file"""
+    if not url:
+        return False
+    
+    # Check for PDF file extensions in the path
+    parsed = urlparse(url if '://' in url else 'http://' + url)
+    path = parsed.path.lower()
+    
+    # Check if path ends with PDF extensions
+    if any(path.endswith(ext) for ext in PDF_EXTENSIONS):
+        return True
+    
+    # Check for PDF domains
+    domain = parsed.netloc.lower()
+    
+    # Remove www. prefix if present
+    if domain.startswith('www.'):
+        domain = domain[4:]
+        
+    # Check if domain matches any known PDF domains
+    for pdf_domain in PDF_DOMAINS:
+        if domain == pdf_domain or domain.endswith('.' + pdf_domain):
             return True
             
     return False
@@ -173,7 +213,7 @@ def register_handlers(c: TelegramClient):
             "<b>Welcome to the Link Cleaner Bot</b>\n"
             "• Each line should be: <b>Title: link</b>\n"
             "• Send two .txt files:\n"
-            "   1) <b>Old file</b>\n"
+            "   1) <b>Old file</b> (with unique links)\n"
             "   2) <b>New file</b>\n"
             "• Tap <b>Convert</b> → removes lines from NEW if their link exists in OLD.\n\n"
             f"🕒 <b>Time (IST)</b>: {ist_now_str()}\n"
@@ -258,9 +298,12 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
         await event.edit("⏳ Processing your files...")
 
     # Build set of normalized links from OLD file
+    # OLD file already contains unique links, so we just extract them all
     old_links = set()
     old_lines_count = 0
     old_videos = 0
+    old_pdfs = 0
+    
     with open(old_file, "r", encoding="utf-8", errors="ignore") as f:
         for raw in f:
             line = raw.strip()
@@ -272,6 +315,8 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
                 old_links.add(norm)
                 if is_video_link(norm):
                     old_videos += 1
+                elif is_pdf_link(norm):
+                    old_pdfs += 1
 
     # Process NEW file: keep only lines whose (normalized) link not in old_links; de-dupe within new
     kept_lines = []
@@ -280,6 +325,7 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
     kept_pdfs = 0
     total_new_lines = 0
     new_videos = 0
+    new_pdfs = 0
 
     with open(new_file, "r", encoding="utf-8", errors="ignore") as f:
         for raw in f:
@@ -290,9 +336,12 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
             # Extract + normalize link
             norm = extract_link_from_line(line)
             
-            # Count videos in new file
-            if norm and is_video_link(norm):
-                new_videos += 1
+            # Count videos and PDFs in new file
+            if norm:
+                if is_video_link(norm):
+                    new_videos += 1
+                elif is_pdf_link(norm):
+                    new_pdfs += 1
                 
             if not norm:
                 # If a line has no detectable URL, keep it
@@ -305,7 +354,7 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
             # Counts by type
             if is_video_link(norm):
                 kept_videos += 1
-            if ".pdf" in norm:
+            elif is_pdf_link(norm):
                 kept_pdfs += 1
 
     kept_count = len(kept_lines)
@@ -340,14 +389,15 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
         f"🆔 <b>User ID</b>: <code>{chat_id}</code>\n"
         f"🕒 <b>Time (IST)</b>: {ist_now_str()}\n\n"
         f"📂 <b>Old File Lines</b>: <code>{old_lines_count}</code>\n"
-        f"📂 <b>Old Unique Links</b>: <code>{len(old_links)}</code>\n"
         f"📂 <b>Old Videos</b>: <code>{old_videos}</code>\n"
+        f"📂 <b>Old PDFs</b>: <code>{old_pdfs}</code>\n"
         f"🆕 <b>New Lines</b>: <code>{total_new_lines}</code>\n"
         f"🆕 <b>New Videos</b>: <code>{new_videos}</code>\n"
+        f"🆕 <b>New PDFs</b>: <code>{new_pdfs}</code>\n"
         f"✅ <b>Updated Lines</b>: <code>{kept_count}</code>\n"
         f"✅ <b>Updated Videos</b>: <code>{kept_videos}</code>\n"
-        f"❌ <b>Removed</b>: <code>{removed}</code>\n"
-        f"🎬 <b>Videos</b>: <code>{kept_videos}</code> • 📄 <b>PDFs</b>: <code>{kept_pdfs}</code>\n\n"
+        f"✅ <b>Updated PDFs</b>: <code>{kept_pdfs}</code>\n"
+        f"❌ <b>Removed</b>: <code>{removed}</code>\n\n"
         f"— {BRAND}"
     )
 
@@ -358,9 +408,9 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
         f"🆔 <b>User ID</b>: <code>{chat_id}</code>\n"
         f"🕒 <b>Time (IST)</b>: {ist_now_str()}\n\n"
         f"📂 <b>Old File</b>: <code>{os.path.basename(old_file)}</code>\n"
-        f"   └ <b>Lines</b>: {old_lines_count} | <b>Links</b>: {len(old_links)} | <b>Videos</b>: {old_videos}\n\n"
+        f"   └ <b>Lines</b>: {old_lines_count} | <b>Videos</b>: {old_videos} | <b>PDFs</b>: {old_pdfs}\n\n"
         f"📂 <b>New File</b>: <code>{os.path.basename(new_file)}</code>\n"
-        f"   └ <b>Lines</b>: {total_new_lines} | <b>Videos</b>: {new_videos}\n\n"
+        f"   └ <b>Lines</b>: {total_new_lines} | <b>Videos</b>: {new_videos} | <b>PDFs</b>: {new_pdfs}\n\n"
         f"📂 <b>Updated File</b>: <code>{updated_file_name}</code>\n"
         f"   └ <b>Lines</b>: {kept_count} | <b>Videos</b>: {kept_videos} | <b>PDFs</b>: {kept_pdfs} | <b>Removed</b>: {removed}\n\n"
         f"— {BRAND}"
