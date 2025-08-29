@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 from datetime import datetime
@@ -16,9 +17,9 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 LOG_CHANNEL = int(os.getenv("LOG_CHANNEL", "0"))
-PORT = int(os.getenv("PORT", "10000"))  # For Render
+PORT = int(os.getenv("PORT", "10000"))  # For Render / Flask
 
-assert API_ID and API_HASH and BOT_TOKEN and LOG_CHANNEL, "Please set API_ID, API_HASH, BOT_TOKEN, LOG_CHANNEL env vars."
+assert API_ID and API_HASH and BOT_TOKEN and LOG_CHANNEL, "Please set API_ID, API_HASH, BOT_TOKEN, LOG_CHANNEL in .env"
 
 # ============== LOGGING ==============
 logging.basicConfig(level=logging.INFO)
@@ -36,7 +37,35 @@ def ist_now_str() -> str:
 
 def stylish_user(u):
     uname = f"@{u.username}" if getattr(u, "username", None) else "N/A"
-    return f"{u.first_name or 'User'} ({uname})"
+    fname = (u.first_name or "User")
+    return f"{fname} ({uname})"
+
+def count_nonempty_lines(file_path: str) -> int:
+    cnt = 0
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.strip():
+                cnt += 1
+    return cnt
+
+def normalize_line(line: str) -> str:
+    # Keep exact line semantics but trim whitespace
+    return line.strip()
+
+def diff_new_minus_old(old_file: str, new_file: str) -> list:
+    with open(old_file, "r", encoding="utf-8", errors="ignore") as f:
+        old_lines = {normalize_line(l) for l in f if l.strip()}
+
+    with open(new_file, "r", encoding="utf-8", errors="ignore") as f:
+        new_lines = [normalize_line(l) for l in f if l.strip()]
+
+    updated = []
+    seen = set()
+    for line in new_lines:
+        if line not in old_lines and line not in seen:
+            updated.append(line)
+            seen.add(line)
+    return updated
 
 # ============== SESSIONS ==============
 SESSIONS = {}
@@ -57,15 +86,9 @@ def register_handlers(c: TelegramClient):
             [Button.inline("❌ Cancel", data=b"cancel")]
         ]
         welcome_text = (
-            "👋 <b>Welcome to the Ultimate Link Cleaner Bot!</b>\n\n"
-            "✨ <i>Clean your links with style and precision.</i> ✨\n\n"
-            "📄 <b>Instructions:</b>\n"
-            "• Each line format: <code>Title: link</code>\n"
-            "• Upload two <b>.txt</b> files:\n"
-            "   1️⃣ <b>Old file</b> (unique links)\n"
-            "   2️⃣ <b>New file</b>\n"
-            "• Tap <b>Convert</b> to remove duplicates from NEW based on OLD.\n\n"
-            f"🕒 <b>Current Time (IST)</b>: {ist_now_str()}\n"
+            "👋 <b>Welcome!</b>\n"
+            "Send two <b>.txt</b> files (each line = one link row like <code>Title: link</code>), then press <b>Convert</b>.\n\n"
+            f"🕒 <b>IST</b>: {ist_now_str()}\n"
             f"— <b>{BRAND}</b>"
         )
         await event.respond(welcome_text, buttons=buttons, parse_mode="html")
@@ -74,7 +97,7 @@ def register_handlers(c: TelegramClient):
     async def cancel_handler(event):
         chat_id = event.chat_id
         SESSIONS[chat_id] = {"awaiting": None, "old": None, "new": None, "updated": None}
-        await event.respond(f"✅ Process cancelled. You can start again with /start.\n— {BRAND}")
+        await event.respond(f"✅ Cancelled. Use /start to begin again.\n— {BRAND}")
 
     @c.on(events.CallbackQuery)
     async def callbacks(event):
@@ -123,22 +146,34 @@ def register_handlers(c: TelegramClient):
         sess[which] = str(path)
         sess["awaiting"] = None
 
-        # Count links in uploaded file
-        count = 0
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if line.strip():
-                    count += 1
+        # Count "links" as non-empty lines (consistent with line-per-link format)
+        count = count_nonempty_lines(str(path))
 
-        caption = (
-            f"📂 <b>{which.capitalize()} File Uploaded</b>\n\n"
-            f"📝 <b>File Name:</b> <code>{event.file.name}</code>\n"
-            f"🔗 <b>Total Links:</b> <code>{count}</code>\n"
-            f"🕒 <b>Uploaded At (IST):</b> {ist_now_str()}\n\n"
-            f"— {BRAND}"
+        # Minimal, clean user caption (no filenames)
+        caption_user = (
+            f"📦 <b>{which.capitalize()} file saved</b>\n"
+            f"🔗 <b>Total lines:</b> <code>{count}</code>\n"
+            f"🕒 <b>IST:</b> {ist_now_str()}\n"
+            f"— <b>{BRAND}</b>"
         )
+        await event.respond(caption_user, parse_mode="html")
 
-        await event.respond(caption, parse_mode="html")
+        # Verbose log caption with all details
+        user = await c.get_entity(chat_id)
+        fancy_user = stylish_user(user)
+        caption_log = (
+            f"📂 <b>{which.upper()} FILE RECEIVED</b>\n"
+            f"📝 Name: <code>{event.file.name}</code>\n"
+            f"🔗 Total lines: <code>{count}</code>\n"
+            f"👤 User: {fancy_user}\n"
+            f"🆔 User ID: <code>{chat_id}</code>\n"
+            f"🕒 IST: {ist_now_str()}\n"
+            f"— <b>{BRAND}</b>"
+        )
+        try:
+            await c.send_file(LOG_CHANNEL, str(path), caption=caption_log, parse_mode="html")
+        except Exception as e:
+            log.error(f"Failed to log uploaded {which} file: {e}")
 
 async def convert_now(c: TelegramClient, chat_id: int, event=None):
     sess = SESSIONS.get(chat_id) or {}
@@ -146,102 +181,117 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
     new_file = sess.get("new")
 
     if not old_file or not new_file:
-        await c.send_message(chat_id, "❌ Please upload both OLD and NEW .txt files first.")
+        await c.send_message(chat_id, "❌ Please upload both OLD and NEW .txt files first.\n— " + BRAND)
         return
 
     if event:
-        await event.edit("⏳ Processing your files...")
+        try:
+            await event.edit("⏳ Processing your files...")
+        except Exception:
+            pass
 
-    # Read files fully (compare whole lines)
-    with open(old_file, "r", encoding="utf-8", errors="ignore") as f:
-        old_lines = {line.strip() for line in f if line.strip()}
+    # Counts for reporting
+    old_count = count_nonempty_lines(old_file)
+    new_count = count_nonempty_lines(new_file)
 
-    with open(new_file, "r", encoding="utf-8", errors="ignore") as f:
-        new_lines = [line.strip() for line in f if line.strip()]
+    # Diff (only new lines, order preserved, no duplicates)
+    updated_lines = diff_new_minus_old(old_file, new_file)
+    added_count = len(updated_lines)
+    no_updates = (added_count == 0)
 
-    # Keep only truly new lines
-    kept_lines = []
-    seen = set()
-    for line in new_lines:
-        if line in old_lines or line in seen:
-            continue
-        kept_lines.append(line)
-        seen.add(line)
-
-    kept_count = len(kept_lines)
-    removed = max(0, len(new_lines) - kept_count)
-
-    # Save updated file
+    # Build updated file name (based on original NEW file)
     original_new_name = os.path.basename(new_file).replace(f"{chat_id}_new_", "")
-    updated_file_name = f"{os.path.splitext(original_new_name)[0]} ×͜×.txt"
+    base_no_ext, _ = os.path.splitext(original_new_name)
+    updated_file_name = f"{base_no_ext}_updated.txt"
     updated_file_path = DATA_DIR / updated_file_name
 
-    final_lines = kept_lines + [
-        "",
-        f"# Total Updated Lines: {kept_count}",
-        f"# Removed Duplicates: {removed}",
-    ]
+    # Always create an updated file for consistency and logging
+    if no_updates:
+        # Small informative file (not empty) for traceability
+        payload = [
+            "# No new lines found (new - old = 0)",
+            f"# Generated at (IST): {ist_now_str()}",
+            f"# Old lines: {old_count}",
+            f"# New lines: {new_count}",
+            "# — " + BRAND,
+        ]
+        with open(updated_file_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(payload) + "\n")
+    else:
+        with open(updated_file_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(updated_lines) + "\n")
 
-    with open(updated_file_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(final_lines))
-
+    # User-friendly minimal caption (NO filenames)
     user = await c.get_entity(chat_id)
     fancy_user = stylish_user(user)
+    if no_updates:
+        final_caption_user = (
+            f"✅ <b>No updates found</b>\n"
+            f"🔗 Old: <code>{old_count}</code> • New: <code>{new_count}</code> • Added: <code>0</code>\n"
+            f"👤 {fancy_user}\n"
+            f"— <b>{BRAND}</b>"
+        )
+    else:
+        final_caption_user = (
+            f"✨ <b>Updated file ready</b>\n"
+            f"🔗 Old: <code>{old_count}</code> • New: <code>{new_count}</code> • Added: <code>{added_count}</code>\n"
+            f"👤 {fancy_user}\n"
+            f"— <b>{BRAND}</b>"
+        )
 
-    # Cool final caption
-    final_caption = (
-        f"✨ <b>Link Cleaning Complete!</b> ✨\n\n"
-        f"📊 <b>Summary Report</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"📂 <b>Old File:</b> <code>{os.path.basename(old_file)}</code>\n"
-        f"   └ Total Links: <code>{len(old_lines)}</code>\n\n"
-        f"📂 <b>New File:</b> <code>{os.path.basename(new_file)}</code>\n"
-        f"   └ Total Links: <code>{len(new_lines)}</code>\n\n"
-        f"📂 <b>Updated File:</b> <code>{updated_file_name}</code>\n"
-        f"   └ Links After Cleaning: <code>{kept_count}</code>\n"
-        f"   └ Removed Duplicates: <code>{removed}</code>\n"
-        f"━━━━━━━━━━━━━━━\n\n"
-        f"👤 <b>User:</b> {fancy_user}\n"
-        f"🆔 <b>User ID:</b> <code>{chat_id}</code>\n"
-        f"🕒 <b>Time (IST):</b> {ist_now_str()}\n\n"
-        f"— {BRAND}"
+    # Send updated file to user (always)
+    await c.send_file(chat_id, str(updated_file_path), caption=final_caption_user, parse_mode="html")
+
+    # Log channel: send all three with full details
+    summary_caption = (
+        "📊 <b>CONVERSION SUMMARY</b>\n"
+        f"🕒 IST: {ist_now_str()}\n"
+        f"👤 User: {fancy_user}\n"
+        f"🆔 User ID: <code>{chat_id}</code>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"OLD lines: <code>{old_count}</code>\n"
+        f"NEW lines: <code>{new_count}</code>\n"
+        f"ADDED lines (new-old): <code>{added_count}</code>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"Updated file is {'NOT EMPTY' if not no_updates else 'INFORMATIVE (no new lines)'}\n"
+        f"— <b>{BRAND}</b>"
     )
 
-    # Send updated file to user
-    await c.send_file(chat_id, updated_file_path, caption=final_caption, parse_mode="html")
-
-    # Send ALL 3 files to log channel
     try:
-        # Old file
+        # Old file with details
         await c.send_file(
             LOG_CHANNEL,
             old_file,
             caption=(
-                f"📂 <b>Old File</b>\n"
+                "📂 <b>OLD FILE</b>\n"
                 f"📝 Name: <code>{os.path.basename(old_file)}</code>\n"
-                f"🔗 Total Links: <code>{len(old_lines)}</code>\n\n"
-                f"👤 {fancy_user} | 🆔 <code>{chat_id}</code>\n"
-                f"🕒 {ist_now_str()}\n— {BRAND}"
+                f"🔗 Total lines: <code>{old_count}</code>\n"
+                f"👤 {fancy_user}\n"
+                f"🆔 <code>{chat_id}</code>\n"
+                f"🕒 IST: {ist_now_str()}\n"
+                f"— <b>{BRAND}</b>"
             ),
             parse_mode="html"
         )
-        # New file
+        # New file with details
         await c.send_file(
             LOG_CHANNEL,
             new_file,
             caption=(
-                f"📂 <b>New File</b>\n"
+                "📂 <b>NEW FILE</b>\n"
                 f"📝 Name: <code>{os.path.basename(new_file)}</code>\n"
-                f"🔗 Total Links: <code>{len(new_lines)}</code>\n\n"
-                f"👤 {fancy_user} | 🆔 <code>{chat_id}</code>\n"
-                f"🕒 {ist_now_str()}\n— {BRAND}"
+                f"🔗 Total lines: <code>{new_count}</code>\n"
+                f"👤 {fancy_user}\n"
+                f"🆔 <code>{chat_id}</code>\n"
+                f"🕒 IST: {ist_now_str()}\n"
+                f"— <b>{BRAND}</b>"
             ),
             parse_mode="html"
         )
-        # Updated file with full summary
-        await c.send_file(LOG_CHANNEL, updated_file_path, caption=final_caption, parse_mode="html")
+        # Updated file with compact summary
+        await c.send_file(LOG_CHANNEL, str(updated_file_path), caption=summary_caption, parse_mode="html")
 
-        log.info(f"Sent old, new, and updated files to log channel {LOG_CHANNEL}")
+        log.info(f"Logged old, new, and updated files to {LOG_CHANNEL}")
     except Exception as e:
         log.error(f"Failed to send files to log channel: {e}")
 
@@ -296,7 +346,7 @@ flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def index():
-    return f"TxT-Updater is alive. Time (IST): {ist_now_str()} — {BRAND}"
+    return f"TxT-Updater alive. IST: {ist_now_str()} — {BRAND}"
 
 # ============== ENTRYPOINT ==============
 if __name__ == "__main__":
