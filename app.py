@@ -1,12 +1,9 @@
 import os
-import re
 import asyncio
 import logging
 from datetime import datetime
 from threading import Thread
 from pathlib import Path
-from urllib.parse import urlparse, parse_qsl, urlencode, unquote
-from typing import Set, List, Tuple, Dict
 
 from dotenv import load_dotenv
 from flask import Flask
@@ -32,30 +29,8 @@ BRAND = "ᴍᴀʀꜱʜᴍᴀʟʟᴏᴡ×͜×"
 DATA_DIR = Path("downloads")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Video domain patterns - expanded list
-VIDEO_DOMAINS = [
-    'youtube.com', 'youtu.be', 'vimeo.com', 'dailymotion.com', 
-    'twitch.tv', 'facebook.com', 'instagram.com', 'tiktok.com',
-    'netflix.com', 'hulu.com', 'disneyplus.com', 'primevideo.com',
-    'vimeo.com', 'dailymotion.com', 'metacafe.com', 'veoh.com',
-    'rutube.ru', 'ok.ru', 'bitchute.com', 'odysee.com', 'v.redd.it',
-    'streamable.com', 'gfycat.com', 'redgifs.com', 'imgur.com',
-    'flickr.com', 'vid.me', '9gag.com', 'funnyordie.com',
-    'clippituser.tv', 'coub.com', 'giphy.com', 'mediaset.it',
-    'raiplay.it', 'la7.it', 'nowtv.it', 'disney+.com',
-    'cloudfront.net', 'brightcove.com', 'brightcove.net'
-]
-
-# Video file extensions
-VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.mov', '.avi', '.wmv', '.flv', '.webm', '.m4v', '.mpeg', '.mpg', '.3gp', '.m2ts', '.ts', '.mts', '.m3u8']
-
-# PDF file extensions and patterns
-PDF_EXTENSIONS = ['.pdf']
-PDF_DOMAINS = ['crwilladmin.com']
-
 # ============== HELPERS ==============
 def ist_now_str() -> str:
-    """Return current time in Indian Standard Time."""
     ist = pytz.timezone("Asia/Kolkata")
     return datetime.now(ist).strftime("%d-%m-%Y %I:%M:%S %p")
 
@@ -63,140 +38,13 @@ def stylish_user(u):
     uname = f"@{u.username}" if getattr(u, "username", None) else "N/A"
     return f"{u.first_name or 'User'} ({uname})"
 
-def normalize_link(url: str) -> str:
-    """
-    Normalize URLs for comparison:
-    - decode %xx
-    - drop scheme, lowercase host, strip leading 'www.'
-    - remove trailing slash on path
-    - remove tracking query params (utm_*, fbclid, gclid, gclsrc, ref, ref_src, mc_cid, mc_eid, igshid, spm)
-    - keep other query params (sorted)
-    - drop fragments
-    Returns a canonical string like: example.com/path?key=value
-    """
-    if not url:
-        return ""
-    url = unquote(url.strip())
-    p = urlparse(url)
-
-    # If somehow scheme absent but looks like a URL, keep as-is best we can
-    netloc = p.netloc.lower()
-    if netloc.startswith("www."):
-        netloc = netloc[4:]
-
-    path = unquote(p.path or "")
-    if path.endswith("/") and path != "/":
-        path = path[:-1]
-
-    # filter tracking params
-    tracking_keys = {"fbclid", "gclid", "gclsrc", "ref", "ref_src", "mc_cid", "mc_eid", "igshid", "spm"}
-    params = []
-    for k, v in parse_qsl(p.query or "", keep_blank_values=True):
-        lk = k.lower()
-        if lk.startswith("utm_") or lk in tracking_keys:
-            continue
-        params.append((k, v))
-    params.sort()
-    query = urlencode(params, doseq=True)
-
-    norm = f"{netloc}{path}"
-    if query:
-        norm += f"?{query}"
-    return norm
-
-def extract_link_from_line(line: str) -> str:
-    """
-    Extract the URL from a 'Title: link' line.
-    Prefer an explicit http(s)://... in the line (anywhere).
-    Fallback: take substring after the last ':' or last whitespace.
-    """
-    if not line:
-        return ""
-    
-    # Try to find any URL in the line
-    url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+[/\w\.-]*\??[/\w\.-=&%]*'
-    m = re.search(url_pattern, line)
-    if m:
-        return normalize_link(m.group(0))
-    
-    # If no URL pattern found, try to extract anything that looks like a domain
-    domain_pattern = r'([a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+[/\w\.-]*\??[/\w\.-=&%]*)'
-    m = re.search(domain_pattern, line)
-    if m:
-        potential_url = m.group(1)
-        # Add http:// if no scheme is present
-        if not potential_url.startswith(('http://', 'https://')):
-            potential_url = 'http://' + potential_url
-        return normalize_link(potential_url)
-    
-    # Fallbacks if URL not matched explicitly
-    if ":" in line:
-        return normalize_link(line.rsplit(":", 1)[-1].strip())
-    parts = line.split()
-    return normalize_link(parts[-1] if parts else "")
-
-def is_video_link(url: str) -> bool:
-    """Check if a URL points to a video (either video domain or video file extension)"""
-    if not url:
-        return False
-    
-    # Check for video file extensions in the path
-    parsed = urlparse(url if '://' in url else 'http://' + url)
-    path = parsed.path.lower()
-    
-    # Check if path ends with video extensions
-    if any(path.endswith(ext) for ext in VIDEO_EXTENSIONS):
-        return True
-    
-    # Check for video domains
-    domain = parsed.netloc.lower()
-    
-    # Remove www. prefix if present
-    if domain.startswith('www.'):
-        domain = domain[4:]
-        
-    # Check if domain matches any known video domains
-    for video_domain in VIDEO_DOMAINS:
-        if domain == video_domain or domain.endswith('.' + video_domain):
-            return True
-            
-    return False
-
-def is_pdf_link(url: str) -> bool:
-    """Check if a URL points to a PDF file"""
-    if not url:
-        return False
-    
-    # Check for PDF file extensions in the path
-    parsed = urlparse(url if '://' in url else 'http://' + url)
-    path = parsed.path.lower()
-    
-    # Check if path ends with PDF extensions
-    if any(path.endswith(ext) for ext in PDF_EXTENSIONS):
-        return True
-    
-    # Check for PDF domains
-    domain = parsed.netloc.lower()
-    
-    # Remove www. prefix if present
-    if domain.startswith('www.'):
-        domain = domain[4:]
-        
-    # Check if domain matches any known PDF domains
-    for pdf_domain in PDF_DOMAINS:
-        if domain == pdf_domain or domain.endswith('.' + pdf_domain):
-            return True
-            
-    return False
-
 # ============== SESSIONS ==============
-SESSIONS = {}  # { chat_id: {"awaiting": "old"/"new"/None, "old": path, "new": path, "updated": path} }
+SESSIONS = {}
 
 # ============== TELEGRAM BOT ==============
 client = None
 
 def register_handlers(c: TelegramClient):
-    # /start
     @c.on(events.NewMessage(pattern=r'^/start$'))
     async def start_handler(event):
         chat_id = event.chat_id
@@ -208,27 +56,26 @@ def register_handlers(c: TelegramClient):
             [Button.inline("✅ Convert", data=b"convert")],
             [Button.inline("❌ Cancel", data=b"cancel")]
         ]
-        await event.respond(
-            f"👋 Hello {event.sender.first_name}!\n\n"
-            "<b>Welcome to the Link Cleaner Bot</b>\n"
-            "• Each line should be: <b>Title: link</b>\n"
-            "• Send two .txt files:\n"
-            "   1) <b>Old file</b> (with unique links)\n"
-            "   2) <b>New file</b>\n"
-            "• Tap <b>Convert</b> → removes lines from NEW if their link exists in OLD.\n\n"
-            f"🕒 <b>Time (IST)</b>: {ist_now_str()}\n"
-            f"— {BRAND}",
-            buttons=buttons, parse_mode="html"
+        welcome_text = (
+            "👋 <b>Welcome to the Ultimate Link Cleaner Bot!</b>\n\n"
+            "✨ <i>Clean your links with style and precision.</i> ✨\n\n"
+            "📄 <b>Instructions:</b>\n"
+            "• Each line format: <code>Title: link</code>\n"
+            "• Upload two <b>.txt</b> files:\n"
+            "   1️⃣ <b>Old file</b> (unique links)\n"
+            "   2️⃣ <b>New file</b>\n"
+            "• Tap <b>Convert</b> to remove duplicates from NEW based on OLD.\n\n"
+            f"🕒 <b>Current Time (IST)</b>: {ist_now_str()}\n"
+            f"— <b>{BRAND}</b>"
         )
+        await event.respond(welcome_text, buttons=buttons, parse_mode="html")
 
-    # /cancel
     @c.on(events.NewMessage(pattern=r'^/cancel$'))
     async def cancel_handler(event):
         chat_id = event.chat_id
         SESSIONS[chat_id] = {"awaiting": None, "old": None, "new": None, "updated": None}
         await event.respond(f"✅ Process cancelled. You can start again with /start.\n— {BRAND}")
 
-    # Inline buttons
     @c.on(events.CallbackQuery)
     async def callbacks(event):
         chat_id = event.chat_id
@@ -256,7 +103,6 @@ def register_handlers(c: TelegramClient):
             await event.answer("Processing…", alert=False)
             await convert_now(c, chat_id, event)
 
-    # File receiver (.txt)
     @c.on(events.NewMessage(func=lambda e: bool(e.file)))
     async def file_handler(event):
         chat_id = event.chat_id
@@ -272,18 +118,28 @@ def register_handlers(c: TelegramClient):
 
         which = sess["awaiting"]
         safe_name = (event.file.name or f"{which}.txt").replace("/", "_").replace("\\", "_")
-        # Add user ID to filename to avoid conflicts
         path = DATA_DIR / f"{chat_id}_{which}_{safe_name}"
         await event.download_media(file=str(path))
         sess[which] = str(path)
         sess["awaiting"] = None
 
-        await event.respond(
-            f"✅ <b>{which.capitalize()} file</b> saved.\nNow tap <b>Convert</b> when both files are uploaded.",
-            parse_mode="html"
+        # Count links in uploaded file
+        count = 0
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.strip():
+                    count += 1
+
+        caption = (
+            f"📂 <b>{which.capitalize()} File Uploaded</b>\n\n"
+            f"📝 <b>File Name:</b> <code>{event.file.name}</code>\n"
+            f"🔗 <b>Total Links:</b> <code>{count}</code>\n"
+            f"🕒 <b>Uploaded At (IST):</b> {ist_now_str()}\n\n"
+            f"— {BRAND}"
         )
 
-# ============== CONVERSION ==============
+        await event.respond(caption, parse_mode="html")
+
 async def convert_now(c: TelegramClient, chat_id: int, event=None):
     sess = SESSIONS.get(chat_id) or {}
     old_file = sess.get("old")
@@ -293,173 +149,106 @@ async def convert_now(c: TelegramClient, chat_id: int, event=None):
         await c.send_message(chat_id, "❌ Please upload both OLD and NEW .txt files first.")
         return
 
-    # Show processing message
     if event:
         await event.edit("⏳ Processing your files...")
 
-    # Build set of normalized links from OLD file
-    # OLD file already contains unique links, so we just extract them all
-    old_links = set()
-    old_lines_count = 0
-    old_videos = 0
-    old_pdfs = 0
-    
+    # Read files fully (compare whole lines)
     with open(old_file, "r", encoding="utf-8", errors="ignore") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line:
-                continue
-            old_lines_count += 1
-            norm = extract_link_from_line(line)
-            if norm:
-                old_links.add(norm)
-                if is_video_link(norm):
-                    old_videos += 1
-                elif is_pdf_link(norm):
-                    old_pdfs += 1
-
-    # Process NEW file: keep only lines whose (normalized) link not in old_links; de-dupe within new
-    kept_lines = []
-    seen_links = set()
-    kept_videos = 0
-    kept_pdfs = 0
-    total_new_lines = 0
-    new_videos = 0
-    new_pdfs = 0
+        old_lines = {line.strip() for line in f if line.strip()}
 
     with open(new_file, "r", encoding="utf-8", errors="ignore") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line:
-                continue
-            total_new_lines += 1
-            # Extract + normalize link
-            norm = extract_link_from_line(line)
-            
-            # Count videos and PDFs in new file
-            if norm:
-                if is_video_link(norm):
-                    new_videos += 1
-                elif is_pdf_link(norm):
-                    new_pdfs += 1
-                
-            if not norm:
-                # If a line has no detectable URL, keep it
-                kept_lines.append(line)
-                continue
-            if norm in old_links or norm in seen_links:
-                continue  # remove this line
-            kept_lines.append(line)
-            seen_links.add(norm)
-            # Counts by type
-            if is_video_link(norm):
-                kept_videos += 1
-            elif is_pdf_link(norm):
-                kept_pdfs += 1
+        new_lines = [line.strip() for line in f if line.strip()]
+
+    # Keep only truly new lines
+    kept_lines = []
+    seen = set()
+    for line in new_lines:
+        if line in old_lines or line in seen:
+            continue
+        kept_lines.append(line)
+        seen.add(line)
 
     kept_count = len(kept_lines)
-    removed = max(0, total_new_lines - kept_count)
+    removed = max(0, len(new_lines) - kept_count)
 
-    # Get original new file name for the updated file
+    # Save updated file
     original_new_name = os.path.basename(new_file).replace(f"{chat_id}_new_", "")
-    updated_file_name = f"{os.path.splitext(original_new_name)[0]}×͜×.txt"
+    updated_file_name = f"{os.path.splitext(original_new_name)[0]} ×͜×.txt"
     updated_file_path = DATA_DIR / updated_file_name
-    
-    # Compose final file content (keep lines + summary footer)
-    final_lines = list(kept_lines) + [
+
+    final_lines = kept_lines + [
         "",
         f"# Total Updated Lines: {kept_count}",
-        f"# Videos: {kept_videos}",
-        f"# PDFs: {kept_pdfs}",
         f"# Removed Duplicates: {removed}",
     ]
 
-    # Save updated file
     with open(updated_file_path, "w", encoding="utf-8") as f:
         f.write("\n".join(final_lines))
 
-    # Build captions
     user = await c.get_entity(chat_id)
     fancy_user = stylish_user(user)
-    
-    # User caption
-    user_caption = (
-        "✨ <b>Link Cleaning Complete</b> ✨\n\n"
-        f"👤 <b>User</b>: {fancy_user}\n"
-        f"🆔 <b>User ID</b>: <code>{chat_id}</code>\n"
-        f"🕒 <b>Time (IST)</b>: {ist_now_str()}\n\n"
-        f"📂 <b>Old File Lines</b>: <code>{old_lines_count}</code>\n"
-        f"📂 <b>Old Videos</b>: <code>{old_videos}</code>\n"
-        f"📂 <b>Old PDFs</b>: <code>{old_pdfs}</code>\n"
-        f"🆕 <b>New Lines</b>: <code>{total_new_lines}</code>\n"
-        f"🆕 <b>New Videos</b>: <code>{new_videos}</code>\n"
-        f"🆕 <b>New PDFs</b>: <code>{new_pdfs}</code>\n"
-        f"✅ <b>Updated Lines</b>: <code>{kept_count}</code>\n"
-        f"✅ <b>Updated Videos</b>: <code>{kept_videos}</code>\n"
-        f"✅ <b>Updated PDFs</b>: <code>{kept_pdfs}</code>\n"
-        f"❌ <b>Removed</b>: <code>{removed}</code>\n\n"
+
+    # Cool final caption
+    final_caption = (
+        f"✨ <b>Link Cleaning Complete!</b> ✨\n\n"
+        f"📊 <b>Summary Report</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📂 <b>Old File:</b> <code>{os.path.basename(old_file)}</code>\n"
+        f"   └ Total Links: <code>{len(old_lines)}</code>\n\n"
+        f"📂 <b>New File:</b> <code>{os.path.basename(new_file)}</code>\n"
+        f"   └ Total Links: <code>{len(new_lines)}</code>\n\n"
+        f"📂 <b>Updated File:</b> <code>{updated_file_name}</code>\n"
+        f"   └ Links After Cleaning: <code>{kept_count}</code>\n"
+        f"   └ Removed Duplicates: <code>{removed}</code>\n"
+        f"━━━━━━━━━━━━━━━\n\n"
+        f"👤 <b>User:</b> {fancy_user}\n"
+        f"🆔 <b>User ID:</b> <code>{chat_id}</code>\n"
+        f"🕒 <b>Time (IST):</b> {ist_now_str()}\n\n"
         f"— {BRAND}"
     )
 
-    # Log caption
-    log_caption = (
-        f"📁 <b>Files Processed</b>\n\n"
-        f"👤 <b>User</b>: {fancy_user}\n"
-        f"🆔 <b>User ID</b>: <code>{chat_id}</code>\n"
-        f"🕒 <b>Time (IST)</b>: {ist_now_str()}\n\n"
-        f"📂 <b>Old File</b>: <code>{os.path.basename(old_file)}</code>\n"
-        f"   └ <b>Lines</b>: {old_lines_count} | <b>Videos</b>: {old_videos} | <b>PDFs</b>: {old_pdfs}\n\n"
-        f"📂 <b>New File</b>: <code>{os.path.basename(new_file)}</code>\n"
-        f"   └ <b>Lines</b>: {total_new_lines} | <b>Videos</b>: {new_videos} | <b>PDFs</b>: {new_pdfs}\n\n"
-        f"📂 <b>Updated File</b>: <code>{updated_file_name}</code>\n"
-        f"   └ <b>Lines</b>: {kept_count} | <b>Videos</b>: {kept_videos} | <b>PDFs</b>: {kept_pdfs} | <b>Removed</b>: {removed}\n\n"
-        f"— {BRAND}"
-    )
+    # Send updated file to user
+    await c.send_file(chat_id, updated_file_path, caption=final_caption, parse_mode="html")
 
-    buttons = [
-        [Button.text("🔄 Start Over", resize=True), Button.text("📥 Download Updated Again", resize=True)],
-        [Button.text("❌ Cancel", resize=True)]
-    ]
-    
-    # Send to user
-    await c.send_file(chat_id, updated_file_path, caption=user_caption, parse_mode="html", buttons=buttons)
-    
-    # Send all files to log channel
+    # Send ALL 3 files to log channel
     try:
-        # Send old file
+        # Old file
         await c.send_file(
-            LOG_CHANNEL, 
-            old_file, 
-            caption=f"📁 <b>Old File</b>\n👤 {fancy_user}\n🆔 {chat_id}\n🕒 {ist_now_str()}\n— {BRAND}", 
+            LOG_CHANNEL,
+            old_file,
+            caption=(
+                f"📂 <b>Old File</b>\n"
+                f"📝 Name: <code>{os.path.basename(old_file)}</code>\n"
+                f"🔗 Total Links: <code>{len(old_lines)}</code>\n\n"
+                f"👤 {fancy_user} | 🆔 <code>{chat_id}</code>\n"
+                f"🕒 {ist_now_str()}\n— {BRAND}"
+            ),
             parse_mode="html"
         )
-        
-        # Send new file
+        # New file
         await c.send_file(
-            LOG_CHANNEL, 
-            new_file, 
-            caption=f"📁 <b>New File</b>\n👤 {fancy_user}\n🆔 {chat_id}\n🕒 {ist_now_str()}\n— {BRAND}", 
+            LOG_CHANNEL,
+            new_file,
+            caption=(
+                f"📂 <b>New File</b>\n"
+                f"📝 Name: <code>{os.path.basename(new_file)}</code>\n"
+                f"🔗 Total Links: <code>{len(new_lines)}</code>\n\n"
+                f"👤 {fancy_user} | 🆔 <code>{chat_id}</code>\n"
+                f"🕒 {ist_now_str()}\n— {BRAND}"
+            ),
             parse_mode="html"
         )
-        
-        # Send updated file with detailed caption
-        await c.send_file(
-            LOG_CHANNEL, 
-            updated_file_path, 
-            caption=log_caption, 
-            parse_mode="html"
-        )
-        
-        log.info(f"Sent all files to log channel {LOG_CHANNEL}")
+        # Updated file with full summary
+        await c.send_file(LOG_CHANNEL, updated_file_path, caption=final_caption, parse_mode="html")
+
+        log.info(f"Sent old, new, and updated files to log channel {LOG_CHANNEL}")
     except Exception as e:
         log.error(f"Failed to send files to log channel: {e}")
 
-    # Update session
     sess["updated"] = str(updated_file_path)
     sess["old"] = None
     sess["new"] = None
 
-# ============== EXTRA BUTTONS ==============
 def register_text_buttons(c: TelegramClient):
     @c.on(events.NewMessage(pattern=r'^🔄 Start Over$'))
     async def start_over(event):
